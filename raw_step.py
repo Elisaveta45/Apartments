@@ -1,11 +1,8 @@
 from datetime import datetime
-import glob
 from typing import Optional, Set, cast
-from sqlalchemy import create_engine
 import pandas as pd
 from argparse import ArgumentParser, Namespace
 from pathlib import Path
-from pandas.core.tools.datetimes import to_datetime
 
 DATE_FORMAT = r"%Y%m%dT%H%M%S"
 FD = None
@@ -30,22 +27,22 @@ MONTH_NAME_TO_IDX = {
 MONTH_NAME_TO_STR_IDX = {
     month_name: str(idx + 1) for idx, month_name in enumerate(MONTH_NAMES)
 }
-KNOWN_APARTMENT_FIELDS: Set[str] = set(
-    [
-        "Вода:",
-        "Газ:",
-        "Двор:",
-        "Етаж:",
-        "Категория:",
-        "Квадратура:",
-        "Начин на ползване:",
-        "Площ:",
-        "Регулация:",
-        "Строителство:",
-        "ТEЦ:",
-        "Ток:",
-    ]
-)
+
+KNOWN_APARTMENT_FIELDS: Set[str] = {
+    "Вода:",
+    "Газ:",
+    "Двор:",
+    "Етаж:",
+    "Категория:",
+    "Квадратура:",
+    "Начин на ползване:",
+    "Площ:",
+    "Регулация:",
+    "Строителство:",
+    "ТEЦ:",
+    "Ток:",
+}
+
 APARTMENT_FIELD_TO_DICT_KEY = {
     "Вода:": "water",
     "Газ:": "gas",
@@ -74,8 +71,75 @@ def try_read_json(json_path: Path, for_date: pd.Timestamp) -> pd.DataFrame:
 
 
 def drop_duplicates(df):
-    df = df.drop_duplicates(subset=["link", "created_at"])
-    df = df.drop_duplicates(subset=["link", "last_updated"])
+    # TODO: Drop duplicates after merging insert update time
+    df.drop_duplicates(subset=["link", "entry_time"], inplace=True)
+
+    return df
+
+
+def merge_insert_update_time(df):
+    df["entry_time"] = df["last_updated"].combine_first(df["created_at"])
+    df.drop(["created_at", "last_updated"], axis=1, inplace=True)
+    cond = df.entry_time.str.contains("Коригирана", na=False)
+
+    # TODO: Change to True/False
+    df.loc[cond, "is_creation"] = True
+    df.loc[~cond, "is_creation"] = False
+
+    return df
+
+
+def floor_to_sqm(df):
+    cond = df.floor.str.contains(r"\d+ кв.м", na=False)
+
+    df.loc[cond, "sqm"] = df.loc[cond, "floor"]
+    df.loc[cond, "floor"] = None
+
+    return df
+
+
+def floor_to_built(df):
+    cond = df.floor.str.contains(r".* \d+ г.", na=False)
+
+    df.loc[cond, "built"] = df.loc[cond, "floor"]
+    df.loc[cond, "floor"] = None
+
+    return df
+
+
+def swap_space_sqm(df):
+    # TODO: Can change `isnull` to `notna`
+    cond = (df["space"].notna()) & (df["sqm"].isnull())
+    df.loc[cond, ["space", "sqm"]] = df.loc[cond, ["sqm", "space"]].values
+    return df
+
+
+def extract_floor(df):
+    new = df.floor.str.extract(
+        r"(?P<new_floor>\d+|Партер)((?P<help>\D+)(?P<max_floor>\d+))?"
+    )
+    # TODO: No need to replace in the whole data frame. "Партер" is seen in 
+    # only one of the columns
+    new_replace = new.replace("Партер", 0)
+    df[["floor", "max_floor"]] = new_replace[["new_floor", "max_floor"]]
+
+    return df
+
+
+def extract_area(df):
+    new = df.sqm.str.split(" ", n=1, expand=True)
+    df["apartment_area"], df["area_type"] = new[0], new[1]
+    df["apartment_area"].astype(float)
+    df.drop(["sqm"], axis=1, inplace=True)
+
+    return df
+
+
+def extract_price(df):
+    new = df.price.str.rsplit(" ", n=1, expand=True)
+    new[0] = new[0].str.replace(" ", "")
+    df["price"], df["price_currency"] = new[0], new[1]
+    df["price"].astype(float)
 
     return df
 
@@ -85,7 +149,18 @@ def readall(
     to_date: Optional[pd.Timestamp] = None,
 ):
     # TODO: Change path
-    crawl_runs_folder = Path("<path_to_crawled_runs>")
+    path_str = "/".join(
+        [
+            "C:",
+            "Users",
+            "ElisavetaPopova",
+            "Desktop",
+            "workspace",
+            "data_engineer_internship_apartments_training",
+            "crawl_runs",
+        ]
+    )
+    crawl_runs_folder = Path(path_str)
     crawl_runs_iter = crawl_runs_folder.iterdir()
 
     filtered_runs_iter = crawl_runs_iter
@@ -106,7 +181,7 @@ def readall(
     dfs = (
         try_read_json(
             run / "apartments.json",
-            pd.to_datetime(run.stem, format=DATE_FORMAT),
+            cast(pd.Timestamp, pd.to_datetime(run.stem, format=DATE_FORMAT)),
         )
         for run in filtered_runs_iter
     )
@@ -137,5 +212,22 @@ if __name__ == "__main__":
     TD = pd.to_datetime(args.td, format=DATE_FORMAT)
 
     df = readall(FD, TD)
+
+    # TODO: For some reason `area_type` has "кв.м" and "кв.м ".
+    # Strip the column values before doing additional transformations.
+    
+    # TODO: Make columns into correct types. Ex apartment_area should be float.
+    # Currently if you do `df.dtypes` you see that everything aside from
+    # the `crawled_at` column is an object.
+    df = (
+        df.pipe(merge_insert_update_time)
+        .pipe(drop_duplicates)
+        .pipe(floor_to_sqm)
+        .pipe(floor_to_built)
+        .pipe(swap_space_sqm)
+        .pipe(extract_floor)
+        .pipe(extract_area)
+        .pipe(extract_price)
+    )
 
     print(df)
